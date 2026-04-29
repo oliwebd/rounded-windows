@@ -21,7 +21,8 @@ jobs:
         run: |
           UUID="rounded-windows@marcosgt.github.io"
           mkdir -p dist
-          zip -r "dist/${UUID}.zip" \
+          glib-compile-schemas schemas
+          zip -r "dist/${UUID}.shell-extension.zip" \
             extension.js \
             effect.js \
             prefs.js \
@@ -32,7 +33,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/rounded-windows@marcosgt.github.io.zip
+          files: dist/*.zip
           body: |
             ## Instalación
 
@@ -40,8 +41,12 @@ jobs:
             2. Ve a https://extensions.gnome.org/local/ y usa **Instalar desde archivo**,
                o ejecuta:
                ```bash
-               gnome-extensions install rounded-windows@marcosgt.github.io.zip
+               gnome-extensions install rounded-windows@marcosgt.github.io.shell-extension.zip
                ```
+
+            ## Cambios
+
+            Ver CHANGELOG.md en el repositorio para el resumen de esta versión.
 
             ---
             Para publicar en extensions.gnome.org, sube el `.zip` manualmente en:
