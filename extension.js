@@ -62,7 +62,9 @@ let _settings       = null;
 let _connections    = [];   // global connections
 const _actorMap     = new WeakMap();
 let _mutterSettings = null;
+let _mutterSettingsConn = 0;
 let _fractionalScaling = null;
+let _settingsTimeoutId = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings helpers
@@ -192,6 +194,11 @@ function isListedWindow(identifiers, list) {
 
 function getAppType(win) {
     const pid = win.get_pid();
+
+    // Prevent infinite growth of the PID cache
+    if (_appTypeCache.size > 200)
+        _appTypeCache.clear();
+
     if (_appTypeCache.has(pid))
         return _appTypeCache.get(pid);
 
@@ -313,8 +320,13 @@ function isFractionalScalingEnabled() {
         return _fractionalScaling;
 
     try {
-        if (!_mutterSettings)
+        if (!_mutterSettings) {
             _mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
+            _mutterSettingsConn = _mutterSettings.connect('changed::experimental-features', () => {
+                _fractionalScaling = null;
+                refreshAll();
+            });
+        }
 
         const features = _mutterSettings.get_strv('experimental-features');
         const isWayland = !Meta.is_wayland_compositor || Meta.is_wayland_compositor();
@@ -597,6 +609,7 @@ function onAddEffect(actor) {
     _actorMap.set(actor, {
         shadow,
         bindings,
+        connections: [],
         signalsAttached: false,
         timeoutId: 0,
     });
@@ -619,6 +632,14 @@ function onRemoveEffect(actor) {
 
     const data = _actorMap.get(actor);
     if (!data) return;
+
+    // Disconnect per-window signals safely
+    if (data.connections) {
+        for (const c of data.connections) {
+            try { c.obj.disconnect(c.id); } catch (_) {}
+        }
+        data.connections = [];
+    }
 
     // Unbind property mirrors
     for (const b of data.bindings)
@@ -748,20 +769,26 @@ function attachWindowSignals(actor) {
     if (data?.signalsAttached)
         return;
 
+    if (!data) return;
+
+    const addWinConn = (obj, sig, cb) => {
+        if (obj) data.connections.push({ obj, id: obj.connect(sig, cb) });
+    };
+
     const win     = actor.metaWindow;
     const texture = getWindowTexture(actor);
 
     // Window resized → update shader uniforms
-    addConnection(actor,   'notify::size',  () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
+    addWinConn(actor,   'notify::size',  () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
     if (texture)
-        addConnection(texture, 'size-changed', () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
+        addWinConn(texture, 'size-changed', () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
 
     // Fullscreen state changed (may not cause a size change)
-    addConnection(win, 'notify::fullscreen',     () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
+    addWinConn(win, 'notify::fullscreen',     () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
     // Focus changed → update shadow style
-    addConnection(win, 'notify::appears-focused',() => { if (actor.metaWindow) refreshFocus(actor); });
+    addWinConn(win, 'notify::appears-focused',() => { if (actor.metaWindow) refreshFocus(actor); });
     // Monitor / workspace change
-    addConnection(win, 'workspace-changed',      () => { if (actor.metaWindow) refreshFocus(actor); });
+    addWinConn(win, 'workspace-changed',      () => { if (actor.metaWindow) refreshFocus(actor); });
 
     if (data)
         data.signalsAttached = true;
@@ -830,10 +857,6 @@ function applyEffectToWindow(win) {
 }
 
 function removeEffectFrom(actor) {
-    removeConnections(actor);
-    removeConnections(actor.metaWindow);
-    const tex = getWindowTexture(actor);
-    if (tex) removeConnections(tex);
     onRemoveEffect(actor);
 }
 
@@ -899,10 +922,18 @@ function enableEffect() {
     // Window re-stack → reorder shadow actors
     addConnection(global.display, 'restacked', onRestacked);
 
-    // Settings changed → reapply all
+    // Settings changed → reapply all with debounce to prevent slider lag
     addConnection(_settings, 'changed', () => {
-        _appTypeCache.clear();
-        refreshAll();
+        if (_settingsTimeoutId) {
+            GLib.source_remove(_settingsTimeoutId);
+            _settingsTimeoutId = 0;
+        }
+        _settingsTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+            _appTypeCache.clear();
+            refreshAll();
+            _settingsTimeoutId = 0;
+            return GLib.SOURCE_REMOVE;
+        });
     });
 }
 
@@ -910,7 +941,17 @@ function disableEffect() {
     for (const actor of global.get_window_actors())
         removeEffectFrom(actor);
     disconnectAll();
+    
+    if (_settingsTimeoutId) {
+        GLib.source_remove(_settingsTimeoutId);
+        _settingsTimeoutId = 0;
+    }
+    
     _appTypeCache.clear();
+    if (_mutterSettings && _mutterSettingsConn) {
+        _mutterSettings.disconnect(_mutterSettingsConn);
+        _mutterSettingsConn = 0;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
