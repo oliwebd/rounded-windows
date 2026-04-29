@@ -255,8 +255,9 @@ export default class RoundedWindowsPreferences extends ExtensionPreferences {
         // Blacklist / whitelist
         const listGroup = new Adw.PreferencesGroup({
             title:       _('Exceptions list'),
-            description: _('WM class names, one per line. In normal mode these windows are EXCLUDED; ' +
-                           'enable whitelist mode to ONLY apply rounded corners to them.'),
+            description: _('Application identifiers, one per line. You can use WM_CLASS, Wayland app IDs, ' +
+                           'or desktop file IDs. In normal mode these windows are EXCLUDED; enable ' +
+                           'whitelist mode to ONLY apply rounded corners to them.'),
         });
         appsPage.add(listGroup);
 
@@ -309,9 +310,8 @@ export default class RoundedWindowsPreferences extends ExtensionPreferences {
 
         const listBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 4 });
         listBox.append(new Gtk.Label({
-            label:  _('One WM class name per line. To find it, run:\n' +
-                      '<tt>gdbus call --session -d org.gnome.Shell -o /org/gnome/Shell ' +
-                      '-m org.gnome.Shell.Eval "global.get_window_actors().map(a=>a.metaWindow.get_wm_class_instance())"</tt>'),
+            label:  _('Use one identifier per line. For X11/XWayland this is usually the WM_CLASS; ' +
+                      'on Wayland-native apps it can be the application ID or desktop file ID.'),
             use_markup: true,
             wrap:   true,
             xalign: 0,

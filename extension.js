@@ -30,6 +30,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -53,6 +54,7 @@ const SHADOW_PADDING          = 80;   // extra pixels around the shadow actor
 // ActorData = {
 //   shadow         : St.Bin | null,
 //   propertyBindings: GObject.Binding[],
+//   signalsAttached : boolean,
 //   timeoutId      : GLib.Source | 0,
 // }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +119,76 @@ function logDbg(msg) {
 // Application type detection  (libadwaita / libhandy)
 // ─────────────────────────────────────────────────────────────────────────────
 const _appTypeCache = new Map();   // pid ↦ 'LibAdwaita' | 'LibHandy' | 'Other'
+const ROUNDABLE_WINDOW_TYPES = [
+    Meta.WindowType.NORMAL,
+    Meta.WindowType.DIALOG,
+    Meta.WindowType.MODAL_DIALOG,
+    Meta.WindowType.UTILITY,
+    Meta.WindowType.SPLASHSCREEN,
+    Meta.WindowType.TOOLBAR,
+].filter(type => type !== undefined);
+
+function normalizeAppId(value) {
+    if (typeof value !== 'string')
+        return '';
+    return value.trim().replace(/\.desktop$/i, '');
+}
+
+function getWindowIdentifiers(win) {
+    const identifiers = new Set();
+    const add = value => {
+        if (typeof value !== 'string')
+            return;
+
+        const trimmed = value.trim();
+        if (!trimmed)
+            return;
+
+        identifiers.add(trimmed);
+
+        const normalized = normalizeAppId(trimmed);
+        if (normalized)
+            identifiers.add(normalized);
+    };
+
+    try {
+        add(win.get_wm_class_instance?.());
+        add(win.get_wm_class?.());
+    } catch (_) {}
+
+    try {
+        add(win.gtkApplicationId ?? win.get_gtk_application_id?.());
+    } catch (_) {}
+
+    try {
+        add(win.get_sandboxed_app_id?.());
+    } catch (_) {}
+
+    try {
+        const tracker = Shell.WindowTracker.get_default();
+        const app = tracker?.get_window_app(win) ?? null;
+        add(app?.get_id?.());
+        add(app?.get_name?.());
+    } catch (_) {}
+
+    return [...identifiers];
+}
+
+function isListedWindow(identifiers, list) {
+    const lookup = new Set(
+        identifiers
+            .map(id => normalizeAppId(id))
+            .filter(Boolean),
+    );
+
+    for (const item of list) {
+        const normalized = normalizeAppId(item);
+        if (normalized && lookup.has(normalized))
+            return true;
+    }
+
+    return false;
+}
 
 function getAppType(win) {
     const pid = win.get_pid();
@@ -142,23 +214,12 @@ function getAppType(win) {
 
 /** True when this window should NOT get rounded corners. */
 function shouldSkip(win) {
-    // DING (Desktop Icons NG) desktop pseudo-window
-    // gtkApplicationId is a property in GJS (not a method)
-    try {
-        const appId = win.gtkApplicationId ?? win.get_gtk_application_id?.();
-        if (appId === 'com.rastersoft.ding') return true;
-    } catch (_) {}
+    const identifiers = getWindowIdentifiers(win);
+    if (identifiers.some(id => ['com.rastersoft.ding', 'ding'].includes(normalizeAppId(id))))
+        return true;
 
-    const wmClass = win.get_wm_class_instance();
-    if (!wmClass)
-        return true;   // null or empty string – not yet initialised
-
-    const normalTypes = [
-        Meta.WindowType.NORMAL,
-        Meta.WindowType.DIALOG,
-        Meta.WindowType.MODAL_DIALOG,
-    ];
-    if (!normalTypes.includes(win.windowType))
+    const windowType = win.windowType ?? win.get_window_type?.();
+    if (!ROUNDABLE_WINDOW_TYPES.includes(windowType))
         return true;
 
     // Blacklist / whitelist logic:
@@ -168,7 +229,7 @@ function shouldSkip(win) {
     //     only listed windows are INCLUDED, all others are excluded
     const blacklist     = getS('blacklist');
     const whitelistMode = getB('whitelist-mode');
-    const isListed      = blacklist.includes(wmClass);
+    const isListed      = isListedWindow(identifiers, blacklist);
 
     if (whitelistMode && !isListed)
         return true;   // whitelist mode: skip apps not in the list
@@ -198,45 +259,40 @@ function shouldSkip(win) {
 // Actor helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+function findTextureActor(actor) {
+    if (!actor)
+        return null;
+
+    if (actor.get_texture?.())
+        return actor;
+
+    let child = actor.get_first_child?.() ?? null;
+    while (child) {
+        const textured = findTextureActor(child);
+        if (textured)
+            return textured;
+
+        child = child.get_next_sibling?.() ?? null;
+    }
+
+    return null;
+}
+
 /**
  * Get the Clutter.Actor to which the rounded-corners effect should be applied.
  *
- * For Wayland-native windows the effect goes on the WindowActor itself.
- *
- * For ALL X11/XWayland windows (decorated or not) the effect goes on the
- * *first child* (MetaSurfaceActor).  Reasons:
- *
- *   • MetaWindowActorX11.paint() may composite Mutter's own drop-shadow into
- *     the same FBO.  Even when `has_shadow()` returns FALSE (as it does for
- *     WM-decorated windows), the offscreen FBO's outermost pixel rows/columns
- *     can be partially transparent, producing a visible fringe around the
- *     window.  Applying the effect to the surface child avoids this entirely.
- *
- *   • For WM-decorated windows (VirtualBox, OBS, Qt, GTK2 apps), the
- *     MetaSurfaceActor's texture already includes the full WM frame (title
- *     bar + borders + client area) because in GNOME 46+ the frame is drawn
- *     by the `mutter-x11-frames` process into the same XWayland buffer.
- *     So rounding the surface child correctly rounds the entire visible
- *     window, not just the client area.
- *
- *   • For undecorated/CSD windows (Electron, Chromium …) the surface child
- *     is just the client window — equally correct.
+ * On GNOME 50 both Wayland-native and X11/XWayland windows render through a
+ * texture-bearing descendant actor. Applying the effect to that actor keeps
+ * the shader aligned with the actual painted content instead of the outer
+ * WindowActor container.
  */
 function targetActor(actor) {
-    const win = actor.metaWindow;
-    if (win && win.get_client_type) {
-        // Meta.WindowClientType.WAYLAND === 1
-        if (win.get_client_type() !== 1) {
-            let child = actor.get_first_child();
-            while (child) {
-                if (child.get_texture?.())
-                    return child;
-                child = child.get_first_child?.() || null;
-            }
-            return actor.get_first_child() || actor;
-        }
-    }
-    return actor;
+    return findTextureActor(actor) ?? actor;
+}
+
+function getWindowTexture(actor) {
+    const target = targetActor(actor);
+    return target?.get_texture?.() ?? actor?.get_texture?.() ?? null;
 }
 
 /** Get the RoundedCornersEffect attached to a window actor (or null). */
@@ -302,34 +358,31 @@ function contentOffset(win) {
  * Compute the shader bounds (x1, y1, x2, y2) in *target-actor-local* pixel
  * coords.  The target actor is determined by targetActor().
  *
- * • Wayland-native → target = WindowActor.
- *   Apply the buffer/frame contentOffset to skip invisible CSD resize grips.
- *
- * • ALL X11/XWayland → target = first_child (MetaSurfaceActor).
- *   For WM-decorated windows (Qt, GTK2, VirtualBox…) contentOffset gives the
- *   delta between buffer and frame rects; we use it to skip the transparent
- *   FBO fringe.  For CSD/undecorated windows the offset is (0,0,0,0) and a
- *   1 px inset is used to avoid rendering the semitransparent edge texels.
+ * The target actor is the texture-bearing descendant returned by targetActor().
+ * Its allocation tracks the actual window buffer, so contentOffset() can be
+ * applied uniformly for Wayland and X11/XWayland windows.
  */
 function computeBounds(actor) {
     const win = actor.metaWindow;
     const sc  = scaleFactor(win);
+    const target = targetActor(actor) ?? actor;
+    const targetW = target.width;
+    const targetH = target.height;
     
     const [dx, dy, dw, dh] = contentOffset(win);
-    // When drawing straight to the MetaWindowActor, its size is actor.width/height.
-    // The frame area starts at (dx, dy) inside the actor, because dx/dy is the
-    // buffer padding (Mutter drop shadow for X11, resize grips for Wayland CSD).
+    // The frame area starts at (dx, dy) inside the buffer actor, because dx/dy
+    // is the difference between the visible frame and the underlying buffer.
     let x1 = dx;
     let y1 = dy;
-    let x2 = dx + actor.width  + dw;
-    let y2 = dy + actor.height + dh;
+    let x2 = dx + targetW + dw;
+    let y2 = dy + targetH + dh;
 
     // Apply a 1px anti-aliasing inset if the window has no buffer padding
     // in that direction to avoid drawing semitransparent texture edge pixels.
     if (x1 === 0) x1 += sc;
     if (y1 === 0) y1 += sc;
-    if (x2 === actor.width)  x2 -= sc;
-    if (y2 === actor.height) y2 -= sc;
+    if (x2 === targetW) x2 -= sc;
+    if (y2 === targetH) y2 -= sc;
 
     return { x1, y1, x2, y2 };
 }
@@ -520,6 +573,11 @@ function onAddEffect(actor) {
     const target = targetActor(actor);
     if (!target) return;
 
+    if (_actorMap.has(actor) || target.get_effect(ROUNDED_CORNERS_EFFECT)) {
+        refreshRoundedCorners(actor);
+        return;
+    }
+
     target.add_effect_with_name(ROUNDED_CORNERS_EFFECT, new RoundedCornersEffect());
 
     let shadow = null;
@@ -536,7 +594,12 @@ function onAddEffect(actor) {
         }
     }
 
-    _actorMap.set(actor, { shadow, bindings, timeoutId: 0 });
+    _actorMap.set(actor, {
+        shadow,
+        bindings,
+        signalsAttached: false,
+        timeoutId: 0,
+    });
     refreshRoundedCorners(actor);
 }
 
@@ -681,8 +744,12 @@ function disconnectAll() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function attachWindowSignals(actor) {
+    const data = _actorMap.get(actor);
+    if (data?.signalsAttached)
+        return;
+
     const win     = actor.metaWindow;
-    const texture = actor.get_texture();
+    const texture = getWindowTexture(actor);
 
     // Window resized → update shader uniforms
     addConnection(actor,   'notify::size',  () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
@@ -695,11 +762,23 @@ function attachWindowSignals(actor) {
     addConnection(win, 'notify::appears-focused',() => { if (actor.metaWindow) refreshFocus(actor); });
     // Monitor / workspace change
     addConnection(win, 'workspace-changed',      () => { if (actor.metaWindow) refreshFocus(actor); });
+
+    if (data)
+        data.signalsAttached = true;
 }
 
 function applyEffectTo(actor) {
+    if (!actor?.metaWindow)
+        return;
+
+    if (_actorMap.has(actor) || getEffect(actor)) {
+        refreshRoundedCorners(actor);
+        attachWindowSignals(actor);
+        return;
+    }
+
     // Wayland / XWayland windows may not have a surface child yet.
-    if (!actor.firstChild) {
+    if (!actor.get_first_child?.()) {
         const connId = actor.connect('notify::first-child', () => {
             actor.disconnect(connId);
             applyEffectTo(actor);
@@ -707,17 +786,7 @@ function applyEffectTo(actor) {
         return;
     }
 
-    const win = actor.metaWindow;
-    const isX11 = win && win.get_client_type && win.get_client_type() !== 1;
-    if (isX11 && !targetActor(actor).get_texture?.()) {
-        const connId = actor.connect('notify::size', () => {
-            actor.disconnect(connId);
-            applyEffectTo(actor);
-        });
-        return;
-    }
-
-    if (!actor.get_texture()) {
+    if (!getWindowTexture(actor)) {
         // The compositor texture is not ready yet.  This happens with Qt /
         // OpenGL-accelerated X11 apps (VirtualBox, Qt-GL, some Chromium builds)
         // where the window is mapped before its first paint arrives.
@@ -739,10 +808,31 @@ function applyEffectTo(actor) {
     attachWindowSignals(actor);
 }
 
+function applyEffectToWindow(win) {
+    if (!win)
+        return;
+
+    const actor = win.get_compositor_private?.();
+    if (actor) {
+        applyEffectTo(actor);
+        return;
+    }
+
+    let connId;
+    connId = win.connect('notify::compositor-private', () => {
+        const nextActor = win.get_compositor_private?.();
+        if (!nextActor)
+            return;
+
+        win.disconnect(connId);
+        applyEffectTo(nextActor);
+    });
+}
+
 function removeEffectFrom(actor) {
     removeConnections(actor);
     removeConnections(actor.metaWindow);
-    const tex = actor.get_texture();
+    const tex = getWindowTexture(actor);
     if (tex) removeConnections(tex);
     onRemoveEffect(actor);
 }
@@ -759,18 +849,7 @@ function enableEffect() {
     // New window created
     addConnection(global.display, 'window-created',
         (_, win) => {
-            const actor = win.get_compositor_private();
-            // get_wm_class_instance() may return null *or* an empty string
-            // for apps (Qt, Electron) that set WM_CLASS asynchronously.
-            // In both cases wait for the property to arrive before applying.
-            if (!win.get_wm_class_instance()) {
-                const nid = win.connect('notify::wm-class', () => {
-                    win.disconnect(nid);
-                    applyEffectTo(actor);
-                });
-            } else {
-                applyEffectTo(actor);
-            }
+            applyEffectToWindow(win);
         });
 
     // Window closed

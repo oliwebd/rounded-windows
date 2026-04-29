@@ -7,7 +7,7 @@
 <h1 align="center">Rounded Window Corners</h1>
 
 <p align="center">
-  A GNOME Shell extension that adds <strong>rounded corners</strong> to every window —<br>
+  A GNOME Shell extension that adds <strong>rounded corners</strong> to top-level windows —<br>
   including apps that don't use libadwaita or libhandy (Firefox, VS Code, Chromium, Electron apps, JetBrains IDEs, etc.).<br>
   GPU-accelerated GLSL shader. No build step, no bundler — pure JavaScript.
 </p>
@@ -43,7 +43,8 @@
 - **Custom shadow** — rounded CSS `box-shadow` replaces GNOME's default rectangular shadow, clipped with the same squircle curve
 - **Border** — optional inner or outer coloured border with configurable width
 - **Smart skip** — automatically skips libadwaita / libhandy apps to avoid double-rounding
-- **Blacklist / Whitelist** — exclude or exclusively include apps by `WM_CLASS`
+- **Blacklist / Whitelist** — exclude or exclusively include apps by `WM_CLASS`, Wayland app ID, or desktop file ID
+- **GNOME 50 / Wayland aware** — matches native Wayland windows without depending on `WM_CLASS`
 - **Live settings** — all changes apply instantly without restarting the shell
 
 ---
@@ -186,15 +187,10 @@ Default shadow values:
 | Skip libadwaita apps | Don't round apps that already have built-in rounded corners | on |
 | Skip libhandy apps | Same, for legacy Handy apps | off |
 | Whitelist mode | Treat the exception list as a whitelist instead of a blacklist | off |
-| Exception list | One `WM_CLASS` name per line | — |
+| Exception list | One application identifier per line (`WM_CLASS`, Wayland app ID, or desktop ID) | — |
 
-**Finding a window's WM_CLASS:**
-```bash
-gdbus call --session --dest org.gnome.Shell \
-  --object-path /org/gnome/Shell \
-  --method org.gnome.Shell.Eval \
-  "global.get_window_actors().map(a => a.metaWindow.get_wm_class_instance()).join('\n')"
-```
+**Finding a window identifier:**
+Use the X11/XWayland `WM_CLASS` when available. For Wayland-native apps, use the app ID or desktop file ID shown by GNOME Shell / your launcher entry.
 
 ---
 
@@ -211,7 +207,11 @@ gdbus call --session --dest org.gnome.Shell \
 
 ### Corners still square on one specific app
 
-Some apps use a custom window class. Add its `WM_CLASS` to the exception list (in whitelist mode) or disable the libadwaita/libhandy skip option.
+Some apps use a custom identifier. Add its `WM_CLASS`, Wayland app ID, or desktop file ID to the exception list (in whitelist mode) or disable the libadwaita/libhandy skip option.
+
+### Wayland limits
+
+GNOME Shell can round top-level windows managed by Mutter. Popup menus, tooltips, override-redirect X11 surfaces, and some client subsurfaces are compositor-limited and may remain square even on GNOME 50 Wayland.
 
 ### Settings window crashes
 
